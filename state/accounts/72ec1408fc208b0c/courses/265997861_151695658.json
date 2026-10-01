@@ -14,8 +14,8 @@
     "account_id": ""
   },
   "progress": {
-    "completed": null,
-    "total": null,
+    "completed": 0,
+    "total": 55,
     "last_completed_task": null,
     "active_task": null
   },
