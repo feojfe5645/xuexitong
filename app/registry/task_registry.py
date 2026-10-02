@@ -305,13 +305,22 @@ class TaskRecord:
         return True
 
     def point_is_server_verified(self) -> bool:
-        """该**点**自身是否带服务端确认（isPassed 的具体对象 id）。
+        """该**点**自身是否带服务端确认。
+
+        两种形状都算：isPassed 首捕的对象 id（经典路径），或 live 点级读数直接判
+        finished（`_heal_by_server_truth` / 铸造 heal，source 固定 "live job
+        points"，无 oid）。后者若无此放宽，`stale_completed_by_catalog` 的章级
+        粗读数会把 healed 记录打回 STALE 重投 —— 站点不为已完成点起流，白耗一次
+        投递（2026-10-02 多章深读方案定案）。
 
         status 会随后续 run 翻脸（FAILED/UNKNOWN），这条不会 —— 多视频章里"第 1 点已过、
         第 2 点没学到"时，靠它判断剩余工作该由兄弟点记录承载。
         """
-        return (getattr(self.verification, "level", "") == "SERVER_VERIFIED"
-                and bool(getattr(self.completion_evidence, "passed_object_ids", None)))
+        if getattr(self.verification, "level", "") != "SERVER_VERIFIED":
+            return False
+        if getattr(self.completion_evidence, "passed_object_ids", None):
+            return True
+        return getattr(self.completion_evidence, "source", "") == "live job points"
 
     def revoked_by_chapter_reading(self) -> bool:
         """该点的「未完成」结论是不是**章级**粗读数下的 —— 而不是这个点自己没过。
@@ -481,6 +490,24 @@ def save_registry(course_key: str, registry: dict[str, TaskRecord]) -> None:
     _atomic_write_text(d / "tasks.json", text)
 
 
+def load_legacy_registry(course_key: str) -> dict[str, TaskRecord]:
+    """P0-2 前 legacy 命名空间（`<repo>/state/registry/<course_key>/`）的只读访问。
+
+    刻意**不**走 `resolve_account_id()` / `set_account_id_hook`——hook 一旦设上，
+    `_registry_dir()` 会指向 account namespace，`load_registry` 就读不到 legacy 账。
+    继承（`bootstrap.inherit_from_legacy`）需要跨命名空间读 legacy 账，
+    用本函数直读固定 legacy 路径；不存在的账返回空 dict。
+    """
+    f = TASKS_DIR / course_key / "tasks.json"
+    if not f.exists():
+        return {}
+    try:
+        data = json.loads(f.read_text(encoding="utf-8"))
+        return {k: TaskRecord.from_dict(v) for k, v in data.items()}
+    except Exception:
+        return {}
+
+
 def load_queue(course_key: str) -> ExecutionQueue:
     f = _queue_file(course_key)
     if not f.exists():
@@ -520,6 +547,44 @@ def load_chapter_points(course_key: str) -> dict:
 def save_chapter_points(course_key: str, points: dict) -> None:
     _atomic_write_text(_points_file(course_key), json.dumps(
         points, ensure_ascii=False, indent=2))
+
+
+def materialize_video_counts_from_points(course_key: str,
+                                         job_points: list) -> dict[str, int]:
+    """从一次登录会话读到的实时点级数据反推 `video_counts` 并写入点级快照。
+
+    共享给 bootstrap（`_materialize_from`）和 probe（`_run_tdvp_probe`）。
+    `build_tasks_from_discovery` 只有拿到 `video_counts[cid]>0` 才产 video task；
+    否则未完成章全走 other → reconcile_queue 只收 video → queue 空 → scheduler
+    "No pending task / probe empty"（issue #4 卡点）。校正后的 `combined.points`
+    覆盖第一个未完成章，本函数把它落成点级快照 + video_counts，让 discovery
+    能产出可执行 video 任务。
+
+    Args:
+        course_key: 课程 identity key（账号命名空间由调用方上下文决定）。
+        job_points: `combined["points"]`，元素含 `task_id`（形如 <cid> 或
+            <cid>:videoN）、`type`、`isFinished`。
+    Returns:
+        `{chapter_id: video_total}`（仅含有 video 点的章）。
+    """
+    video_counts: dict[str, int] = {}
+    finished_by_cid: dict[str, int] = {}
+    for p in job_points or []:
+        if p.get("type") != "video":
+            continue
+        tid = str(p.get("task_id") or "")
+        if not tid:
+            continue
+        cid = tid.split(":")[0]
+        video_counts[cid] = video_counts.get(cid, 0) + 1
+        if p.get("isFinished"):
+            finished_by_cid[cid] = finished_by_cid.get(cid, 0) + 1
+    for cid, n in video_counts.items():
+        set_chapter_point_snapshot(
+            course_key, cid,
+            video_total=n, video_finished=finished_by_cid.get(cid, 0),
+            has_video=True)
+    return video_counts
 
 
 def set_chapter_point_snapshot(

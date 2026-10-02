@@ -921,6 +921,15 @@ def _ensure_bootstrap_on_start(course_url: str, identity_key: str,
         return  # 无账号：account 命名空间不存在，维持原离线/legacy 路径
     try:
         from app.registry.task_registry import load_registry
+        # P0-2 继承先于 bootstrap 材料化：legacy 账已有 video 时直接并入 account 命名空间，
+        # 让本轮及后续 round 都从「真实工作历史」出发；bootstrap 的幂等护栏（registry
+        # 非空 → NOOP）会因此不再误触发，退化账死循环被打破（issue #4 第六层卡点）。
+        from app.registry.bootstrap import inherit_from_legacy
+        rep = inherit_from_legacy(identity_key)
+        if rep.mode != "noop":
+            print(f"[scheduler] P0-2 inherit: mode={rep.mode} status={rep.status} "
+                  f"legacy_tasks={rep.legacy_tasks} inherited={rep.inherited} "
+                  f"total_tasks={rep.total_tasks} reason={rep.reason}", flush=True)
         if load_registry(identity_key):          # 非空 → 幂等 NOOP
             return
         from tvdp.tdvp import fetch_course_detail_and_verify
@@ -975,6 +984,36 @@ def points_prove_no_video(job_points: Optional[list]) -> bool:
     if not job_points:
         return False
     return not any((p or {}).get("type") == "video" for p in job_points)
+
+
+def combined_verify_from_points(points: Optional[list], cid: str = "") -> Optional[dict]:
+    """会话内读到的点级（可跨多章）→ E6.2 复核形状（与 live_verify_chapter 同构）。
+
+    `cid` 给定时先把点级**过滤到该章**——多章深读后 `_combined_points` 覆盖全部
+    未完成章，不过滤会把别章的点数合计进本章快照；该章没有点 → 返回 None 交回
+    独立复核。live_finished 必须带上：reconcile 的 D14 治愈（服务端判 finished
+    的点直接落 COMPLETED）只认这个集合。只传 live_pending 的旧实现让「整章早已
+    看完」的候选治不好 —— run 36984897107 的 1217304741 进页 0% 服务端就回
+    isPassed=true，仍被 rollback 优先规则重新投出去白看 9.5 分钟。
+    """
+    if not points:
+        return None
+    from tvdp.tdvp import build_live_finished, build_live_pending, chapter_video_summary
+    if cid:
+        pts = [p for p in points
+               if str(p.get("task_id") or "").split(":")[0] == str(cid)]
+        if not pts:
+            return None
+    else:
+        pts = list(points)
+    tv, tf = chapter_video_summary(pts)
+    return {
+        "video_total": tv,
+        "video_finished": tf,
+        "live_pending": build_live_pending(pts),
+        "live_finished": build_live_finished(pts),
+        "points": pts,
+    }
 
 
 def duration_probe_policy(video_index) -> "tuple[bool, float]":
@@ -1443,6 +1482,15 @@ def _run_tdvp_probe(course_url: str, course_key: str,
             from tvdp.tdvp import fetch_course_discovery
             chapters_raw = fetch_course_discovery(course_url)
             _combined_points = []
+        # ── issue #4 第五层卡点：把本次会话读到的点级落成快照 ──────────
+        # 校正后的 `_combined_points` 覆盖第一个未完成章，但若不写入点级快照，
+        # 下方 `build_tasks_from_discovery(..., video_counts=video_counts_from_points(
+        # load_chapter_points()))` 拿不到 video_counts → 该章走 other → queue 空 →
+        # "No pending task / probe empty"。bootstrap 已通过
+        # materialize_video_counts_from_points 修复同一问题；probe 共享同一函数。
+        if _combined_points:
+            from app.registry.task_registry import materialize_video_counts_from_points
+            materialize_video_counts_from_points(course_key, _combined_points)
         # 目录拉取空：可能是 CI/Xvfb 抖动的瞬时失败，先显式重试一次。
         # 重试后仍空 → **不臆测选章**（不调用 _fallback_chapter 硬猜）：
         #   否则会像 run 34564369602 那样「目录空 → 兜底到非目标章」，
@@ -1477,7 +1525,12 @@ def _run_tdvp_probe(course_url: str, course_key: str,
             chapters_raw,
             video_counts=video_counts_from_points(load_chapter_points(course_key)))
         reg_before = load_registry(course_key)
-        existing, report = reconcile_registry(course_key, reg_before, tasks, dom_status)
+        # 多章点级真源：本次会话读到 finished 的点，铸造时直接落完成（D14-mint）。
+        # 否则已看完的点以裸 DISCOVERED 进队列被盲目重投（站点不为已完成点起流）。
+        from tvdp.tdvp import build_live_finished
+        existing, report = reconcile_registry(
+            course_key, reg_before, tasks, dom_status,
+            live_finished=build_live_finished(_combined_points))
         save_registry(course_key, existing)
         # [DIAG] 确认第一次 reconcile 后 BLOCKED 是否存活（活体可能在此被 dom_done 覆盖）
         _dp = "1217304719"
@@ -1578,18 +1631,13 @@ def _run_tdvp_probe(course_url: str, course_key: str,
             head = queue.items[0]
             head_cid = head_chapter_id(head, existing, tasks)
             if head_cid:
-                from tvdp.tdvp import chapter_video_summary, build_live_pending
                 verify = None
-                # 洞3：目录发现阶段已顺带读到的该章点级（同一次浏览器），直接复用，
-                #     避免再开一次浏览器（live_verify_chapter）去重复深读。
-                if _combined_points and head_cid == _pred_head:
-                    tv, tf = chapter_video_summary(_combined_points)
-                    verify = {
-                        "video_total": tv,
-                        "video_finished": tf,
-                        "live_pending": build_live_pending(_combined_points),
-                        "points": _combined_points,
-                    }
+                # 洞3：目录发现阶段已顺带读到的点级（同一次浏览器，覆盖全部未完成
+                #     章），按章过滤后直接复用，避免再开一次浏览器重复深读；
+                #     head 章不在读数里时 combined_verify 返回 None → 走独立复核。
+                #     live_finished 一并带上（D14 治愈入口），见 combined_verify_from_points。
+                if _combined_points:
+                    verify = combined_verify_from_points(_combined_points, head_cid)
                 if verify is None:
                     verify = live_verify_chapter(
                         head_cid,
@@ -1602,6 +1650,7 @@ def _run_tdvp_probe(course_url: str, course_key: str,
                 if verify is not None:
                     total_v = verify.get("video_total", 0)
                     live_pending = verify.get("live_pending") or set()
+                    live_finished = verify.get("live_finished") or set()
                     # 洞2：点级真源快照存进 registry（缓存层）；done 由点级校准。
                     from app.registry.task_registry import (
                         set_chapter_point_snapshot, load_chapter_points,
@@ -1617,7 +1666,8 @@ def _run_tdvp_probe(course_url: str, course_key: str,
                     video_counts = {head_cid: total_v} if total_v > 0 else None
                     tasks2 = build_tasks_from_discovery(chapters_raw, video_counts=video_counts)
                     existing2, report2 = reconcile_registry(
-                        course_key, existing, tasks2, dom_status, live_pending=live_pending)
+                        course_key, existing, tasks2, dom_status,
+                        live_pending=live_pending, live_finished=live_finished)
                     # 幻影 :videoN 在**投递之前**收掉：同一次 live 读数既给了该章真实的
                     # 点列表，就没有理由再让引擎花一整晚的唯一次投递去撞它（#26）。
                     from app.registry.reconcile import prune_phantom_points_after_refine

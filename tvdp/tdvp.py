@@ -582,20 +582,55 @@ def fetch_course_discovery(course_url: str, cx_user: Optional[str] = None,
         return None
 
 
+def _corrected_target_cid(target_cid: str, chapters: list[dict]) -> str:
+    """校正深读目标章（纯函数，issue #4 第三层卡点）。
+
+    调用方锚定的 target 章在目录里可能已完成（常见：active_course.raw_url 沿用旧
+    initialize 时的 chapterId 锚点）。读已完成章的点没有意义 —— 它 COMPLETED 不进
+    queue，产出的 video 标记落空，其余待学章全走 other → queue 空 → scheduler 报
+    "No pending task / probe empty"。校正为目录里**第一个未完成章**（status !=
+    completed），让 bootstrap / probe 材料化出的 video 标记落在真正待推进的章上。
+
+    Args:
+        target_cid: 调用方原始锚定的章 id（可为空）。
+        chapters: 目录提取结果 [{chapter_id, title, status, ...}]（可为空）。
+    Returns:
+        应深读的章 id。target 未完成 / 无目录 / 无未完成章时原样返回 target_cid。
+    """
+    if not chapters or not target_cid:
+        return target_cid
+    status_of = {str(c.get("chapter_id") or ""): str(c.get("status") or "")
+                 for c in chapters}
+    if status_of.get(str(target_cid)) != "completed":
+        return target_cid
+    first_pending = next(
+        (str(c.get("chapter_id") or "") for c in chapters
+         if str(c.get("status") or "") != "completed"),
+        None)
+    return first_pending or target_cid
+
+
 def fetch_course_detail_and_verify(
     course_url: str,
     target_cid: str = "",
     cx_user: Optional[str] = None,
     cx_pass: Optional[str] = None,
 ) -> Optional[dict]:
-    """洞3：把「目录发现 + 队首章点级深读」合并进**一次**浏览器会话。
+    """洞3：把「目录发现 + 全部未完成章点级深读」合并进**一次**浏览器会话。
 
-    只登录一次、只开一个 browser/context，既拿目录树（发现），又顺便对
-    target_cid 打开其 cards 帧读真实点（L2 深度验证）。相比 `fetch_course_discovery`
-    再单独 `live_verify_chapter`（两次 launch + 两次登录），显著降低 CI 的双开抖动。
+    只登录一次、只开一个 browser/context，既拿目录树（发现），又顺便对**所有
+    DOM 未完成章**打开 cards 帧读真实点（L2 深度验证）。相比
+    `fetch_course_discovery` 再单独 `live_verify_chapter`（两次 launch + 两次
+    登录），显著降低 CI 的双开抖动；相比旧的单 target 深读，一次点亮全部章的
+    video_counts（2026-10-02 定案，见函数内注释）。
+
+    Args:
+        target_cid: 兼容保留（旧单章读的 target）；现行读取范围由目录状态决定，
+            该参数不再影响行为。
 
     Returns:
-        {"chapters": [...], "points": [{...}] }  （points 为空列表表示非 target/no 卡帧）
+        {"chapters": [...], "points": [{...}] }  （points 为全部未完成章的平铺点级，
+        task_id 前缀区分章节；空列表表示没有任何可读点）
         失败返回 None。
     """
     import os
@@ -645,20 +680,30 @@ def fetch_course_detail_and_verify(
                       "(still extracting)", file=sys.stderr)
             chapters = extract_catalog_from_page(page, course_url)
 
+            # ── 多章点级深读（2026-10-02 排查定案，取代单 target 读）─────────
+            # 旧实现只深读 corrected target 一章：「点亮」能力被锚死在一个章上 ——
+            # run 36993138621 的 URL 锚点章 719 是 PPT 章（无视频点，当年「headed
+            # 抓不到 video」的真相），深读空转 → 全课程无 video_counts → 队列空 →
+            # NOOP，且每轮都锚死同一章。改为一次会话内读**全部 DOM 未完成章**：
+            # 每章 ~12s，29 章实测 ~6min。点级按 task_id 前缀分组落快照，
+            # reconcile 的铸造 heal 把已 finished 的点直接落完成 —— 台账随服务端
+            # 真源自愈，无需考古恢复。
             points = []
-            if target_cid:
+            for ch in chapters or []:
+                cid = str(ch.get("chapter_id") or "")
+                if not cid or str(ch.get("status") or "") == "completed":
+                    continue
                 try:
-                    loaded = read_chapter_job_points(
-                        page, target_cid,
+                    pts = read_chapter_job_points(
+                        page, cid,
                         params.get("course_id", ""),
                         params.get("clazz_id", ""),
                         params.get("cpi", ""),
                     )
-                    points = loaded or []
+                    points.extend(pts or [])
                 except Exception as pe:
-                    # 洞3弹：点级 deep-read 失败不影响已拿到的目录；后续由
-                    # step4.5 的 live_verify 兜底（不在"一次读取"里多开一次浏览器前丢目录）。
-                    print(f"[tdvp] combined point-read failed (catalog kept): {pe}",
+                    # 单章读失败不影响其余章与已拿到的目录（独立复核兜底仍在）。
+                    print(f"[tdvp] point-read failed cid={cid} (kept going): {pe}",
                           file=sys.stderr)
             browser.close()
             return {"chapters": chapters or [], "points": points}
@@ -992,9 +1037,11 @@ def read_chapter_job_points(
     page.wait_for_timeout(7000)
 
     points: list[dict] = []
+    n_cards = 0
     for fr in page.frames:
         if "knowledge/cards" not in fr.url:
             continue
+        n_cards += 1
         try:
             fr.wait_for_selector(".ans-job-item, .ans-job-icon", timeout=8000)
         except Exception:
@@ -1036,6 +1083,12 @@ def read_chapter_job_points(
         }""")
         points.extend(job_rows_to_points(rows, knowledge_id))
         break
+    # 读空必须可归因（run 36993138621：719 深读静默返回空 → 全课程 NOOP，
+    # 日志却无任何痕迹）。cards_frames=0 → 帧没挂载；=1 且 pts=0 → 帧在但没有
+    # 可识别的任务点行（如纯 PPT 章的裸 icon 被 D13 过滤 —— 719 实测）。
+    tv, tf = chapter_video_summary(points)
+    print(f"[tdvp] point-read {knowledge_id}: pts={len(points)} "
+          f"video={tf}/{tv} cards_frames={n_cards}", file=sys.stderr, flush=True)
     return points
 
 
@@ -1082,8 +1135,9 @@ def live_verify_chapter(
 ) -> Optional[dict]:
     """独立章节 live 复核：打开浏览器 → read_chapter_job_points。
 
-    Returns dict 含 {points, video_total, video_finished, live_pending}；
-    失败返回 None。供 scheduler 在选任务前对目标章做 L2 实校（成本有界）。
+    Returns dict 含 {points, video_total, video_finished, live_pending,
+    live_finished}；失败返回 None。供 scheduler 在选任务前对目标章做 L2 实校
+    （成本有界）。
     """
     from playwright.sync_api import sync_playwright
     import os
@@ -1114,6 +1168,7 @@ def live_verify_chapter(
         "video_total": total,
         "video_finished": finished,
         "live_pending": build_live_pending(pts),
+        "live_finished": build_live_finished(pts),
     }
 
 

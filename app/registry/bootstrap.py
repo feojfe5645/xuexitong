@@ -21,6 +21,7 @@
 """
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -47,6 +48,101 @@ def _server_completed_from_catalog(chapters: list) -> int:
                if (ch.get("status") or "").strip().lower() in ("completed", "done"))
 
 
+@dataclass
+class InheritReport:
+    """legacy→account 继承摘要。"""
+    course_key: str
+    mode: str = "noop"            # inherit | noop
+    status: str = "ok"            # ok | error
+    legacy_tasks: int = 0
+    inherited: int = 0            # 从 legacy 拷进 account 账的条数
+    total_tasks: int = 0          # 继承后 account 账任务数
+    reason: str = ""
+    at_utc: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    def to_dict(self) -> dict:
+        return self.__dict__.copy()
+
+
+def inherit_from_legacy(course_key: str) -> InheritReport:
+    """P0-2 继承：把 legacy 命名空间的真实工作历史合并进当前账号命名空间。
+
+    **默认关闭（2026-10-02 fork 审查定案）**：legacy 账（`state/registry/<key>/`）
+    是仓库提交里的**原作者**未 scoped 旧账，随 fork 一起被复制。若对新 fork 账号
+    （namespace 为空）自动继承，会把原作者的完成/失败历史整本搬进 fork 账本，
+    且幂等护栏（registry 非空 → NOOP）从此挡住 P0-3 服务端真源 bootstrap ——
+    fork 用户看到的"已完成"是原作者的，自己没看的视频永远排不进队列。
+    所以默认**不继承**：fork 用户走 README 记载的 bootstrap 路径，从自己账号的
+    服务端真源材料化。确属原作者本机迁移（legacy 账与账号同主）时，显式设
+    `XUE_INHERIT_LEGACY=1` 打开。
+
+    问题（issue #4 第六层卡点）：P0-2 账号隔离把 9 月积累的全部真账
+    （78 任务 / 63 video / 48 COMPLETED）留在 `state/registry/<course_key>/`，
+    而账号命名空间只有 30 条退化账（29 other + 1 已 COMPLETED video）。
+    `reconcile_queue` 只收 video，退化账唯一 video 已 COMPLETED → queue 恒空 →
+    `upcoming=0` → `_ensure_bootstrap_on_start` 幂等 NOOP → 永远造不出 video 任务
+    （自增强死循环）。继承把 legacy 的 63 条 video 带进 account 账，queue 即非空。
+
+    幂等护栏（与 `bootstrap_registry_from_server` 同一条原则）：
+      - legacy 账不存在/为空 → noop，绝不动 account 账；
+      - account 命名空间该课程账已含 **≥1 条未完成的 video 任务**（PENDING/
+        DISCOVERED/FAILED/UNKNOWN/STALE/RUNNING/READY）→ 视为「继承已完成」，
+        noop，绝不重复拷、绝不覆盖既有 account 记录。
+
+      **只有 COMPLETED 的 video 不触发幂等护栏** —— 退化账（issue #4 的 30 条账）
+      恰好含 1 条已 COMPLETED video，被旧判据（"已有 video"）误锁；改成"已有 open
+      video"后，仅 COMPLETED 的退化账仍允许继承，把 legacy 的 PENDING video 带进来。
+
+    合并语义：account 既有记录**优先**保留（它可能带更新的运行时状态，如某章
+    COMPLETED 的 UI 证据），legacy 仅补 account 缺失的 task_id。两条账的 key 空间
+    不重叠（legacy 多用 bare `<cid>` / `<cid>:videoN`，account 退化账用
+    `<cid>:other`），直接按 task_id 并集即可，无需按章去重。
+
+    绝不修改 legacy 源账；只在当前账号命名空间（由调用方 context 决定，测试里用
+    `models.set_account_id_hook` 注入）写。
+    """
+    import os
+    if os.environ.get("XUE_INHERIT_LEGACY", "").strip().lower() \
+            not in ("1", "true", "yes"):
+        return InheritReport(
+            course_key, mode="noop", status="ok",
+            reason="inherit disabled by default (XUE_INHERIT_LEGACY unset); "
+                   "fork users must bootstrap from their own server truth")
+
+    from app.registry.task_registry import (
+        load_registry, save_registry, load_legacy_registry)
+
+    legacy = load_legacy_registry(course_key)
+    if not legacy:
+        return InheritReport(course_key, mode="noop", status="ok",
+                             reason="legacy registry absent or empty; nothing to inherit")
+
+    existing = load_registry(course_key)
+    # 幂等判据必须是「account 已有**未完成**的 video 任务」——只有 COMPLETED 的退化账
+    # （issue #4 的 30 条账恰含 1 条已 COMPLETED video）仍属死循环：queue 恒空、
+    # bootstrap 永久 NOOP。只有存在 PENDING/DISCOVERED/FAILED/UNKNOWN video 才视为
+    # 「继承已完成，别再重拷」。
+    _OPEN_VIDEO = ("PENDING", "DISCOVERED", "FAILED", "UNKNOWN", "STALE", "RUNNING", "READY")
+    if any((t.task_type or "video") == "video" and t.status in _OPEN_VIDEO
+           for t in existing.values()):
+        return InheritReport(
+            course_key, mode="noop", status="ok", legacy_tasks=len(legacy),
+            total_tasks=len(existing),
+            reason="account registry already has open video tasks; inherit is idempotent")
+
+    inherited = 0
+    for tid, rec in legacy.items():
+        if tid in existing:
+            continue           # account 既有记录优先，保留更新状态
+        existing[tid] = rec
+        inherited += 1
+    save_registry(course_key, existing)
+    return InheritReport(
+        course_key, mode="inherit", status="ok", legacy_tasks=len(legacy),
+        inherited=inherited, total_tasks=len(existing),
+        reason=f"inherited {inherited} task(s) from legacy into account namespace")
+
+
 def bootstrap_registry_from_server(
     course_key: str,
     course_url: str,
@@ -54,24 +150,38 @@ def bootstrap_registry_from_server(
     cx_user: Optional[str] = None,
     cx_pass: Optional[str] = None,
     persist_progress: bool = True,
+    force: bool = False,
 ) -> BootstrapReport:
     """账号首次进入课程：由服务端真源材料化 work 列表，并把 progress 写成服务端完成数。
 
     `course_key` 传**课程级 key**（`<course_id>_<clazz_id>`，即 `identity.key()`）；账户
     命名空间由当前登录账号（CX_USER / hook）经 P0-2 的存储层注入。`identity 的账号字段。
 
+    `force=True`（issue #4 建议 1 的「账号对齐」出口）：清空该账号命名空间里本课程的
+    registry 再材料化。用于账本疑似被污染/陈旧（如曾误继承过他人 legacy 账、或想以
+    服务器为准全量重建）的显式操作——只抹**当前账号**本课程的 registry 三件套，
+    绝不触碰其他账号与其他课程。
+
     Returns:
         BootstrapReport（败则 status="error"）。
     """
-    from app.registry.task_registry import load_registry
+    from app.registry.task_registry import (
+        ExecutionQueue, load_registry, save_registry, save_queue,
+        save_chapter_points)
     from tvdp.tdvp import fetch_course_detail_and_verify
     from state.course_state import update_course_state, CourseProgress
 
-    # ── 幂等：该账号命名空间已有该课程任何记录 → 不覆盖、不打服务器 ──
     existing = load_registry(course_key)
-    if existing:
+    if existing and not force:
         return BootstrapReport(course_key, mode="noop", status="ok",
                                reason="registry already present; not touched")
+    if force and existing:
+        # 只清当前账号本课程的派生账（registry 三件套），progress 由材料化后重写。
+        save_registry(course_key, {})
+        save_queue(course_key, ExecutionQueue())
+        save_chapter_points(course_key, {})
+        print(f"[bootstrap] force: wiped {len(existing)} task(s) for {course_key}",
+              file=sys.stderr)
 
     _fetch = fetch_course_detail_and_verify(course_url,
                                             cx_user=cx_user, cx_pass=cx_pass)
@@ -108,7 +218,18 @@ def _materialize_from(course_key, course_url, combined,
     points = combined.get("points") or []
     live_done = build_live_finished(points)
 
-    discovery_tasks = build_tasks_from_discovery(chapters)
+    # ── P0-3 根因修复（issue #4）：bootstrap 必须产出可执行的 video 任务 ──
+    # `build_tasks_from_discovery` 只有拿到 `video_counts[cid]>0` 才产 video task；
+    # 否则所有未完成章都走 `other` 兜底 → registry 全 other → reconcile_queue 只收
+    # video（见 task_registry.reconcile_queue）→ queue 恒空 → scheduler 报
+    # "No pending task / probe empty" → 又一个 NOOP。而 combined 响应里已带本次
+    # 登录会话读到的队首章点级数据（`points`），正好可反推出 video_counts。
+    # 只修复"账上至少有一个 video 可执行任务"这一最小正确性；其余章保持 other，
+    # 由 scheduler 每轮 Step 4.5 的 live 复核渐进补全（该机制已内建）。
+    from app.registry.task_registry import materialize_video_counts_from_points
+    video_counts = materialize_video_counts_from_points(course_key, points)
+
+    discovery_tasks = build_tasks_from_discovery(chapters, video_counts=video_counts)
     if not discovery_tasks:
         return BootstrapReport(course_key, mode="bootstrap",
                                reason="no tasks from server catalog", status="error")
